@@ -1,0 +1,6 @@
+{
+  "name": "AI Medley Architect",
+  "description": "An autonomous AI agent that listens to audio files and orchestrates a seamless medley using FFmpeg and shell execution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
