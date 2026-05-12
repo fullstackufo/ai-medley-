@@ -1,5 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { Upload, FileAudio, Play, Loader2, Sparkles, AlertCircle, FileCheck2, Disc3 } from 'lucide-react';
+import { GoogleGenAI, Type } from '@google/genai';
 
 interface LibraryFile {
   id: string;
@@ -11,6 +12,8 @@ interface LibraryFile {
   analysis?: string;
 }
 
+const geminiApiKey = (process as any).env.GEMINI_API_KEY || '';
+
 export default function App() {
   const [library, setLibrary] = useState<LibraryFile[]>([]);
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -21,13 +24,260 @@ export default function App() {
   const logsEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const [uploadProgress, setUploadProgress] = useState<{current: number, total: number} | null>(null);
+
+  const addLog = (msg: string) => {
+    setLogs(prev => [...prev, `[${new Date().toLocaleTimeString()}] ${msg}`]);
+    console.log(msg);
+  };
+
+  const runAutonomousLoop = async (lib: LibraryFile[]) => {
+    if (!geminiApiKey) {
+      setErrorMessage("GEMINI_API_KEY is not set.");
+      setStatus('error');
+      return;
+    }
+
+    const sid = Math.random().toString(36).substring(7);
+    setSessionId(sid);
+    setLogs([]);
+    setSummary(null);
+    setStatus('running');
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: geminiApiKey });
+      
+      const systemInstruction = `You are AI Medley Architect — a fully autonomous audio engineer.
+Your job is to build a medley out of the provided music library, listen to your output, refine it, and stop only when you are completely satisfied.
+
+# YOUR PROCESS
+1. LISTEN: Review analysis for all files. If any lack analysis, listen to them in full. Extract BPM, key, duration, etc.
+2. DESIGN: Determine optimal song order, select snippets, design crossfades.
+3. BUILD: Execute FFmpeg commands via 'execute_shell_command'.
+4. LISTEN TO OUTPUT: Listen to the MP3 you just built.
+5. SCORE & REFINE: If it has flaws, make targeted changes.
+6. STOP: Call 'finish_medley' when satisfied.
+
+Library Files available:
+${lib.map(f => `- ID: ${f.id}\n  Name: ${f.originalName}\n  Path: ${f.path}\n  Previous Analysis: ${f.analysis || 'NONE'}`).join("\n\n")}
+`;
+
+      const chat = ai.chats.create({
+        model: 'gemini-2.0-flash', 
+        config: {
+          systemInstruction: { parts: [{ text: systemInstruction }] },
+          tools: [{
+            functionDeclarations: [
+              {
+                name: 'execute_shell_command',
+                description: 'Execute a bash command in the work directory.',
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: { command: { type: Type.STRING } },
+                  required: ['command']
+                }
+              },
+              {
+                name: 'listen_to_audio',
+                description: 'Listen to an audio file. Absolute path required.',
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: { filePath: { type: Type.STRING } },
+                  required: ['filePath']
+                }
+              },
+              {
+                name: 'read_file',
+                description: 'Read a text file.',
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: { filePath: { type: Type.STRING } },
+                  required: ['filePath']
+                }
+              },
+              {
+                name: 'write_file',
+                description: 'Write content to a file.',
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: { filePath: { type: Type.STRING }, content: { type: Type.STRING } },
+                  required: ['filePath', 'content']
+                }
+              },
+              {
+                name: 'save_file_analysis',
+                description: 'Save analysis for a file by ID.',
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: { fileId: { type: Type.STRING }, analysisText: { type: Type.STRING } },
+                  required: ['fileId', 'analysisText']
+                }
+              },
+              {
+                name: 'finish_medley',
+                description: 'Call when completely satisfied.',
+                parameters: {
+                  type: Type.OBJECT,
+                  properties: { finalMp3Path: { type: Type.STRING }, summary: { type: Type.STRING } },
+                  required: ['finalMp3Path', 'summary']
+                }
+              }
+            ]
+          }],
+          temperature: 0.1
+        }
+      });
+
+      const sendMessageWithRetry = async (msg: any, retryCount = 0): Promise<any> => {
+        try {
+          return await chat.sendMessage({ message: msg });
+        } catch (err: any) {
+          const isRateLimit = err.message?.includes('429') || err.message?.includes('RESOURCE_EXHAUSTED');
+          if (isRateLimit && retryCount < 5) {
+            const delay = Math.pow(2, retryCount) * 2000 + Math.random() * 1000;
+            addLog(`Rate limited. Retrying in ${Math.round(delay/1000)}s...`);
+            await new Promise(r => setTimeout(r, delay));
+            return sendMessageWithRetry(msg, retryCount + 1);
+          }
+          throw err;
+        }
+      };
+
+      addLog("Initializing Architect...");
+      let result = await sendMessageWithRetry("Begin the medley architect process. Analyze library and build a draft.");
+
+      let loopFinished = false;
+      while (!loopFinished) {
+        if (result.text) addLog(`AI: ${result.text}`);
+        
+        const functionCalls = result.functionCalls;
+        if (!functionCalls || functionCalls.length === 0) {
+          if (!result.text) {
+             result = await sendMessageWithRetry("Please proceed.");
+             continue;
+          }
+          break;
+        }
+
+        const toolResponses: any[] = [];
+        const mediaParts: any[] = [];
+
+        for (const call of functionCalls) {
+          addLog(`Tool: ${call.name}`);
+          const args = call.args as any;
+          let toolRes: any = null;
+
+          try {
+            if (call.name === 'execute_shell_command') {
+              const res = await fetch('/api/exec', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ command: args.command, sessionId: sid })
+              });
+              const data = await res.json();
+              toolRes = { functionResponse: { name: call.name, id: call.id, response: data } };
+            } 
+            else if (call.name === 'listen_to_audio') {
+              addLog(`Analyzing audio ${args.filePath}...`);
+              const entry = lib.find(f => f.path === args.filePath);
+              if (!entry) {
+                 toolRes = { functionResponse: { name: call.name, id: call.id, response: { error: 'File path not found in library.' } } };
+              } else {
+                addLog(`Fetching content for ${entry.originalName}...`);
+                const audioResp = await fetch(`/api/audio-raw/${entry.id}`);
+                const blob = await audioResp.blob();
+                
+                addLog(`Uploading to AI layer...`);
+                // Note: ai.files might also need retry but usually it's one-off. 
+                // We'll wrap it in a try catch or just keep it simple for now.
+                const uploadRes = await ai.files.upload({
+                  file: blob,
+                  config: { mimeType: entry.mimeType }
+                });
+                
+                // Wait for ACTIVE state
+                let fileInfo = uploadRes;
+                let attempts = 0;
+                while (fileInfo.state === 'PROCESSING' && attempts < 15) {
+                  await new Promise(r => setTimeout(r, 2000));
+                  fileInfo = await ai.files.get({ name: uploadRes.name! });
+                  attempts++;
+                }
+
+                if (fileInfo.state === 'ACTIVE') {
+                  toolRes = { functionResponse: { name: call.name, id: call.id, response: { status: 'Audio analysis payload prepared.' } } };
+                  mediaParts.push({ fileData: { fileUri: fileInfo.uri, mimeType: fileInfo.mimeType } });
+                } else {
+                   toolRes = { functionResponse: { name: call.name, id: call.id, response: { error: `File state is ${fileInfo.state}` } } };
+                }
+              }
+            }
+            else if (call.name === 'read_file') {
+              const res = await fetch(`/api/file-read?filePath=${encodeURIComponent(args.filePath)}`);
+              const data = await res.json();
+              toolRes = { functionResponse: { name: call.name, id: call.id, response: data } };
+            }
+            else if (call.name === 'write_file') {
+              const res = await fetch('/api/file-write', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ filePath: args.filePath, content: args.content })
+              });
+              const data = await res.json();
+              toolRes = { functionResponse: { name: call.name, id: call.id, response: data } };
+            }
+            else if (call.name === 'save_file_analysis') {
+              const res = await fetch('/api/library/analysis', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ fileId: args.fileId, analysisText: args.analysisText })
+              });
+              const data = await res.json();
+              toolRes = { functionResponse: { name: call.name, id: call.id, response: data } };
+              await fetchLibrary(); // Refresh library data
+            }
+            else if (call.name === 'finish_medley') {
+              await fetch('/api/session/finish', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ sessionId: sid, finalAudioPath: args.finalMp3Path, summary: args.summary })
+              });
+              setSummary(args.summary);
+              setStatus('completed');
+              loopFinished = true;
+              toolRes = { functionResponse: { name: call.name, id: call.id, response: { status: 'acknowledged' } } };
+            }
+          } catch (e: any) {
+            toolRes = { functionResponse: { name: call.name, id: call.id, response: { error: e.message } } };
+          }
+
+          if (toolRes) toolResponses.push(toolRes);
+        }
+
+        if (toolResponses.length > 0 || mediaParts.length > 0) {
+          const combined = [...toolResponses, ...mediaParts];
+          result = await sendMessageWithRetry(combined);
+        }
+      }
+
+    } catch (e: any) {
+      console.error(e);
+      setStatus('error');
+      setErrorMessage(e.message);
+    }
+  };
+
   const fetchLibrary = async () => {
     try {
       const res = await fetch('/api/library');
-      if (res.ok) {
+      if (res.ok && res.headers.get('content-type')?.includes('application/json')) {
         setLibrary(await res.json());
+      } else if (!res.ok) {
+        console.error('Failed to fetch library:', res.status);
       }
-    } catch(e) {}
+    } catch(e) {
+      console.error('Library fetch error:', e);
+    }
   };
 
   useEffect(() => {
@@ -40,36 +290,14 @@ export default function App() {
     }
   }, [logs]);
 
-  useEffect(() => {
-    let interval: NodeJS.Timeout;
-    if (sessionId && status === 'running') {
-      interval = setInterval(async () => {
-        try {
-          const res = await fetch(`/api/session/${sessionId}`);
-          if (res.ok) {
-            const data = await res.json();
-            setLogs(data.logs || []);
-            if (data.status === 'completed') {
-              setStatus('completed');
-              setSummary(data.summary);
-            } else if (data.status === 'error') {
-              setStatus('error');
-            }
-          }
-        } catch (e) {
-          console.error(e);
-        }
-      }, 2000);
-    }
-    return () => clearInterval(interval);
-  }, [sessionId, status]);
-
   const uploadToLibrary = async (newFiles: File[]) => {
     if (newFiles.length === 0) return;
     setStatus('uploading');
     setErrorMessage(null);
+    setUploadProgress({ current: 0, total: newFiles.length });
     
     try {
+       let count = 0;
        for (const f of newFiles) {
            const formData = new FormData();
            formData.append('files', f);
@@ -78,10 +306,15 @@ export default function App() {
                const errorText = await res.text();
                throw new Error(errorText || res.statusText);
            }
+           count++;
+           setUploadProgress({ current: count, total: newFiles.length });
+           // Refresh library after each successful upload so user sees progress
+           await fetchLibrary();
        }
-       await fetchLibrary();
+       setUploadProgress(null);
        setStatus('idle');
     } catch(e: any) {
+       setUploadProgress(null);
        setStatus('error');
        
        // Handle common payload too large error message
@@ -120,30 +353,7 @@ export default function App() {
 
   const startMedley = async () => {
     if (library.length < 2) return;
-    setStatus('running');
-    setErrorMessage(null);
-    
-    try {
-      const res = await fetch('/api/start', {
-        method: 'POST',
-      });
-
-      if (!res.ok) {
-        let errorText = await res.text();
-        try {
-           const json = JSON.parse(errorText);
-           if (json.error) errorText = json.error;
-        } catch(e) {}
-        console.error('Start failed:', res.status, res.statusText, errorText);
-        throw new Error(`Start failed: ${errorText || res.statusText}`);
-      }
-      const data = await res.json();
-      setSessionId(data.sessionId);
-    } catch (e: any) {
-      console.error(e);
-      setStatus('error');
-      setErrorMessage(e.message);
-    }
+    runAutonomousLoop(library);
   };
 
   // Prevent drag and drop whole page
@@ -245,11 +455,29 @@ export default function App() {
               </div>
 
               {status === 'error' && (
-                <div className="mt-8 border border-[#F27D26]/50 bg-[#F27D26]/10 text-[#F27D26] p-4 text-xs font-mono uppercase font-bold flex items-center rounded-sm">
+                <div className="mt-8 border border-[#F27D26]/50 bg-[#F27D26]/10 text-[#F27D26] p-4 text-xs font-mono uppercase font-bold flex items-center rounded-sm w-full max-w-lg">
                   <AlertCircle className="w-5 h-5 mr-3 shrink-0" />
                   <div>
                     <div>System Integrity Failure</div>
                     {errorMessage && <div className="text-[10px] mt-1 opacity-80 normal-case">{errorMessage}</div>}
+                  </div>
+                </div>
+              )}
+
+              {status === 'uploading' && uploadProgress && (
+                <div className="mt-8 border border-[#00F0FF]/30 bg-[#00F0FF]/5 p-4 rounded-sm w-full max-w-lg">
+                  <div className="flex items-center text-[#00F0FF] text-xs font-mono uppercase font-bold mb-2">
+                    <Loader2 className="w-5 h-5 mr-3 animate-spin" />
+                    Ingesting Archive Data...
+                  </div>
+                  <div className="w-full bg-[#1A1A1A] h-1 rounded-full overflow-hidden">
+                    <div 
+                      className="bg-[#00F0FF] h-full transition-all duration-300" 
+                      style={{ width: `${(uploadProgress.current / uploadProgress.total) * 100}%` }}
+                    ></div>
+                  </div>
+                  <div className="mt-2 text-[10px] font-mono text-[#666] text-right">
+                    {uploadProgress.current} / {uploadProgress.total} Files Cached
                   </div>
                 </div>
               )}
